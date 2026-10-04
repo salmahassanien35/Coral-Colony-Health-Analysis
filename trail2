@@ -1,0 +1,268 @@
+"""
+MATE 2021 Task 2.2 - Coral colony change detection
+===================================================
+Stage 1: segment each image into PINK / WHITE masks (classical, Lab colour space)
+Stage 2: naive comparison of the two masks -> growth / damage / bleaching / recovery
+
+Colour code required by the manual (OpenCV uses BGR order!):
+    growth    = green
+    damage    = yellow
+    bleaching = red
+    recovery  = blue
+
+Run:  python coral_change.py old.jpg new.jpg
+"""
+
+import sys
+import cv2
+import numpy as np
+
+# =====================================================================
+# 0. CONFIG - every tunable number lives here, so you can tweak in one place
+# =====================================================================
+CFG = {
+    # --- segmentation ---
+    "pink_a_margin": 18,      # pink if a* > (cloth median a*) + margin
+    "white_L_margin": 25,     # white if L* > (cloth median L*) + margin ...
+    "white_chroma_max": 14,   # ... AND colour is close to neutral (low chroma)
+    "open_kernel": 3,         # removes tiny speckles
+    "close_kernel": 5,        # fills small holes inside pipes
+    "min_blob_area": 60,      # drop blobs smaller than this (pixels)
+    "white_near_pink_px": 12, # a white blob must touch/be near pink to be coral
+
+    # --- alignment ---
+    "ecc_blur_sigma": 6,      # blur masks so ECC has a wide "basin" to converge
+    "ecc_iterations": 500,
+
+    # --- comparison ---
+    "tolerance_px": 7,        # how many pixels of misalignment we forgive
+    "min_region_area": 150,   # a change region must be at least this big
+}
+
+# BGR colours for drawing
+GREEN, YELLOW, RED, BLUE = (0, 200, 0), (0, 255, 255), (0, 0, 255), (255, 0, 0)
+
+
+# =====================================================================
+# 1. SEGMENTATION
+# =====================================================================
+def clean_mask(mask, open_k, close_k, min_area):
+    """Morphological clean-up: remove speckle, fill holes, drop small blobs."""
+    mask = mask.astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            np.ones((open_k, open_k), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            np.ones((close_k, close_k), np.uint8))
+    # remove connected components smaller than min_area
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    out = np.zeros_like(mask)
+    for i in range(1, n):                       # label 0 is background
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            out[labels == i] = 255
+    return out > 0
+
+
+def segment(img_bgr):
+    """
+    Returns (pink_mask, white_mask) as boolean arrays.
+
+    Idea:
+      * Convert to Lab: L = lightness, a = green<->red, b = blue<->yellow.
+        Pink pipes have a high a*; cloth and white pipes are near-neutral.
+      * Do NOT use fixed thresholds only. Estimate what "cloth" looks like in
+        THIS image (median of non-pink pixels) and threshold relative to it.
+        This makes the method tolerant to different lighting/white balance.
+    """
+    # Light blur so JPEG noise does not create speckle
+    blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+
+    # --- PINK: a* clearly above the typical cloth a* ---
+    # First guess of "cloth" = whole-image median (cloth dominates the image)
+    a_cloth = np.median(a)
+    pink = a > a_cloth + CFG["pink_a_margin"]
+
+    # --- Reference colour of the cloth using only non-pink pixels ---
+    non_pink = ~pink
+    L_cloth = np.median(L[non_pink])
+    a_cloth = np.median(a[non_pink])
+    b_cloth = np.median(b[non_pink])
+
+    # --- WHITE: much brighter than cloth AND low chroma (not tan, not pink) ---
+    # chroma measured as distance from neutral (128,128) in the a-b plane
+    chroma = np.sqrt((a - 128) ** 2 + (b - 128) ** 2)
+    white = (~pink) & (L > L_cloth + CFG["white_L_margin"]) \
+            & (chroma < CFG["white_chroma_max"])
+
+    pink = clean_mask(pink, CFG["open_kernel"], CFG["close_kernel"], CFG["min_blob_area"])
+    white = clean_mask(white, CFG["open_kernel"], CFG["close_kernel"], CFG["min_blob_area"])
+    white &= ~pink                      # a pixel can only have one label
+
+    # Bright cloth patches can pass the "white" test. Real white pipes are
+    # always attached to pink pipes, so keep only white blobs near pink.
+    near_pink = dilate(pink, CFG["white_near_pink_px"])
+    n, labels = cv2.connectedComponents(white.astype(np.uint8))
+    for i in range(1, n):
+        blob = labels == i
+        if not (blob & near_pink).any():
+            white[blob] = False
+    return pink, white
+
+
+# =====================================================================
+# 1b. ALIGNMENT (Stage 3, first version)
+# =====================================================================
+def align_old_to_new(pink_o, white_o, pink_n, white_n):
+    """
+    Find an AFFINE transform that maps the OLD colony onto the NEW one, using
+    the union silhouette (pink OR white) so colour changes do not matter.
+
+    Why affine? In our tests: translation/rotation-only gave IoU ~0.54,
+    affine gave ~0.81, homography gave almost nothing extra. Affine also has
+    fewer free parameters, so it overfits less.
+
+    ECC maximises correlation between two images. We feed it BLURRED masks:
+    blur makes the cost smooth, so the optimiser converges from a rough start.
+    Changed branches (only 2-4 of them) act as mild outliers.
+
+    Returns the warped (pink, white) of the old image + the 2x3 matrix + IoU.
+    """
+    sig = CFG["ecc_blur_sigma"]
+    soft = lambda m: cv2.GaussianBlur(m.astype(np.float32), (0, 0), sig)
+    union_o, union_n = pink_o | white_o, pink_n | white_n
+
+    W = np.eye(2, 3, dtype=np.float32)               # start from identity
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            CFG["ecc_iterations"], 1e-7)
+    # template = NEW, input = OLD -> W maps new coords to old coords
+    cc, W = cv2.findTransformECC(soft(union_n), soft(union_o), W,
+                                 cv2.MOTION_AFFINE, crit, None, 5)
+
+    h, w = pink_n.shape
+    flags = cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP  # so we sample old at W(x)
+    warp = lambda m: cv2.warpAffine(m.astype(np.uint8), W, (w, h), flags=flags) > 0
+    po, wo = warp(pink_o), warp(white_o)
+
+    a, b = po | wo, union_n
+    iou = (a & b).sum() / max((a | b).sum(), 1)       # alignment quality score
+    return po, wo, W, iou
+
+
+# =====================================================================
+# 2. COMPARISON (naive: assumes the images are already roughly aligned)
+# =====================================================================
+def dilate(mask, px):
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
+    return cv2.dilate(mask.astype(np.uint8), k) > 0
+
+
+def erode(mask, px):
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
+    return cv2.erode(mask.astype(np.uint8), k) > 0
+
+
+def keep_big_regions(mask, min_area):
+    """Keep only connected regions >= min_area. Returns cleaned mask."""
+    m = mask.astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m)
+    out = np.zeros(m.shape, bool)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            out[labels == i] = True
+    return out
+
+
+def compare(pink_old, white_old, pink_new, white_new):
+    """
+    Transition table (old -> new):
+        nothing      -> pink   : GROWTH
+        pink / white -> nothing: DAMAGE
+        pink         -> white  : BLEACHING
+        white        -> pink   : RECOVERY
+
+    Tolerance band: a pixel only counts as "was absent before" if it is
+    farther than tol px from the old colony. This forgives small
+    misalignment, so thin edge slivers do not become false changes.
+    """
+    tol = CFG["tolerance_px"]
+    old_any, new_any = pink_old | white_old, pink_new | white_new
+
+    # "far from anything in the other image" masks
+    clearly_new_area = ~dilate(old_any, tol)          # truly empty in old image
+    clearly_gone_area = ~dilate(new_any, tol)         # truly empty in new image
+
+    growth = pink_new & clearly_new_area
+    damage = old_any & clearly_gone_area
+
+    # colour swaps happen where both images HAVE coral; erode the overlap so
+    # that edge pixels (most affected by misalignment) are ignored
+    both = erode(old_any & new_any, tol // 2 + 1)
+    bleach = pink_old & white_new & both
+    recover = white_old & pink_new & both
+
+    changes = {"growth": growth, "damage": damage,
+               "bleaching": bleach, "recovery": recover}
+    # drop tiny regions (noise)
+    return {k: keep_big_regions(v, CFG["min_region_area"]) for k, v in changes.items()}
+
+
+# =====================================================================
+# 3. VISUALISATION
+# =====================================================================
+def mask_overlay(img, pink, white):
+    """Debug view: pink mask in magenta, white mask in cyan."""
+    out = img.copy()
+    out[pink] = (0.4 * out[pink] + 0.6 * np.array((255, 0, 255))).astype(np.uint8)
+    out[white] = (0.4 * out[white] + 0.6 * np.array((255, 255, 0))).astype(np.uint8)
+    return out
+
+
+def alignment_overlay(old_union, new_union):
+    """Red = only old, green = only new, yellow = both. Good alignment = mostly yellow."""
+    out = np.zeros(old_union.shape + (3,), np.uint8)
+    out[old_union & ~new_union] = (0, 0, 255)
+    out[new_union & ~old_union] = (0, 255, 0)
+    out[old_union & new_union] = (0, 255, 255)
+    return out
+
+
+def draw_changes(img, changes):
+    """Draw the contour of each change region in the colour the manual requires."""
+    colours = {"growth": GREEN, "damage": YELLOW, "bleaching": RED, "recovery": BLUE}
+    out = img.copy()
+    for name, mask in changes.items():
+        cnts, _ = cv2.findContours(mask.astype(np.uint8),
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            cv2.rectangle(out, (x - 6, y - 6), (x + w + 6, y + h + 6), colours[name], 3)
+        print(f"{name:10s}: {len(cnts)} region(s), {int(mask.sum())} px")
+    return out
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+if __name__ == "__main__":
+    old_path = sys.argv[1] if len(sys.argv) > 1 else "OneYearImage__1_.jpg"
+    new_path = sys.argv[2] if len(sys.argv) > 2 else "coral1__1_.jpg"
+
+    old = cv2.imread(old_path)
+    new = cv2.imread(new_path)
+    new = cv2.resize(new, (old.shape[1], old.shape[0]))   # same size for now
+
+    pink_o, white_o = segment(old)
+    pink_n, white_n = segment(new)
+
+    # Save debug overlays: ALWAYS look at these before trusting the output
+    cv2.imwrite("debug_old_masks.png", mask_overlay(old, pink_o, white_o))
+    cv2.imwrite("debug_new_masks.png", mask_overlay(new, pink_n, white_n))
+
+    # Warp the old masks into the new image's frame BEFORE comparing
+    pink_o, white_o, W, iou = align_old_to_new(pink_o, white_o, pink_n, white_n)
+    print(f"alignment IoU = {iou:.3f}  (identity was ~0.43)")
+    cv2.imwrite("debug_alignment.png", alignment_overlay(pink_o | white_o, pink_n | white_n))
+
+    changes = compare(pink_o, white_o, pink_n, white_n)
+    cv2.imwrite("result.png", draw_changes(new, changes))
